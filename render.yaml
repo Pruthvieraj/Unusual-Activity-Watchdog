@@ -1,0 +1,20 @@
+# Render Blueprint -- lets Render auto-configure this as a Web Service
+# when you connect the repo via "New +" -> "Blueprint" instead of typing
+# the build/start commands in by hand. (You can also skip this file
+# entirely and paste the same two commands into a plain "Web Service".)
+services:
+  - type: web
+    name: unusual-activity-watchdog
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: >-
+      streamlit run app.py
+      --server.port $PORT
+      --server.address 0.0.0.0
+      --server.headless true
+      --server.enableCORS false
+      --server.enableXsrfProtection false
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9

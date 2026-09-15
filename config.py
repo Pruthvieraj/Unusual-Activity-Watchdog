@@ -47,6 +47,16 @@ class WatchdogConfig:
     correlation_delta_history_window: int = 60  # bars used to judge "is this delta typical"
     news_lookback_hours: int = 6            # "no news" window around a price jump
 
+    # --- Neural autoencoder (second, independent anomaly model) -----------
+    autoencoder_window: int = 3            # bars of feature history flattened into one input
+    autoencoder_hidden_layers: tuple = (12, 4, 12)   # bottleneck at 4 -- forces compression
+    autoencoder_zscore_alert: float = 2.25  # reconstruction-error z-score to flag
+
+    # --- Order-flow surveillance (spoofing / layering / stuffing / wash) ---
+    orderbook_minutes: int = 120
+    orderbook_events_per_minute: int = 8
+    orderbook_n_traders: int = 40
+
     # --- Simulated demo data (used when live data is unavailable) ----------
     simulate_n_bars: int = 400
     simulate_bar_freq_minutes: int = 5

@@ -31,6 +31,7 @@ class Alert:
     headline: str
     detail: str
     evidence: dict = field(default_factory=dict)
+    consensus: bool = False     # True when both the Isolation Forest AND the autoencoder flagged this bar
 
     def to_dict(self) -> dict:
         d = self.__dict__.copy()
@@ -82,11 +83,16 @@ def generate_ticker_alerts(
     alerts: list[Alert] = []
 
     for ticker, df in scored_by_ticker.items():
-        flagged = df[df["is_anomaly"]]
+        # Use the ensemble's broader "any model flagged" net when available
+        # (models/ensemble.py adds this column); fall back to the Isolation
+        # Forest's own flag for callers that only ran that one model.
+        flag_col = "any_model_flagged" if "any_model_flagged" in df.columns else "is_anomaly"
+        flagged = df[df[flag_col]]
         for ts in flagged.index:
             explanation = explain_point(df, ts)
             top_driver = explanation["top_driver"]
             row = df.loc[ts]
+            is_consensus = bool(row["consensus"]) if "consensus" in df.columns else False
 
             # Isolation Forest's `contamination` parameter guarantees a
             # fixed ~5% of bars get flagged as "relatively" anomalous EVEN
@@ -105,14 +111,18 @@ def generate_ticker_alerts(
                 continue
 
             severity = _severity_for_ticker_anomaly(df, ts)
+            if is_consensus:
+                severity = "High"  # two independent models agreeing overrides the usual ranking
+            consensus_tag = " [AI consensus: Isolation Forest + Autoencoder]" if is_consensus else ""
 
             if top_driver == "volume_zscore":
                 alerts.append(Alert(
                     timestamp=ts, kind="volume_burst", tickers=[ticker], severity=severity,
                     headline=f"{ticker}: unusual volume burst",
                     detail=(f"Volume z-score {row['volume_zscore']:.2f} "
-                            f"({row['volume']:,.0f} shares) -- well outside {ticker}'s normal range."),
+                            f"({row['volume']:,.0f} shares) -- well outside {ticker}'s normal range.{consensus_tag}"),
                     evidence={"drivers": explanation["ranked_drivers"], "volume": float(row["volume"])},
+                    consensus=is_consensus,
                 ))
             elif top_driver == "return_zscore":
                 has_news = news_lookup(ticker, ts) if news_lookup else False
@@ -123,13 +133,15 @@ def generate_ticker_alerts(
                         headline=f"{ticker}: large but explained price move",
                         detail=f"{move_pct:+.2f}% move, but a matching headline was found nearby -- likely news-driven.",
                         evidence={"drivers": explanation["ranked_drivers"], "return_pct": float(move_pct)},
+                        consensus=is_consensus,
                     ))
                 else:
                     alerts.append(Alert(
                         timestamp=ts, kind="unexplained_price_jump", tickers=[ticker], severity=severity,
                         headline=f"{ticker}: unexplained price jump",
-                        detail=f"{move_pct:+.2f}% move with no matching headline in the surrounding window.",
+                        detail=f"{move_pct:+.2f}% move with no matching headline in the surrounding window.{consensus_tag}",
                         evidence={"drivers": explanation["ranked_drivers"], "return_pct": float(move_pct)},
+                        consensus=is_consensus,
                     ))
             else:
                 # volatility itself was the dominant driver -- still worth a
@@ -193,6 +205,7 @@ def _merge_consecutive_alerts(df: pd.DataFrame, max_gap_bars: int, bar_minutes: 
                     current["severity"] = "High"
                 current["detail"] = row["detail"]  # keep most recent wording
                 current["evidence"] = row["evidence"]
+                current["consensus"] = current.get("consensus", False) or row.get("consensus", False)
             else:
                 if current is not None:
                     merged_rows.append(current)
@@ -204,7 +217,7 @@ def _merge_consecutive_alerts(df: pd.DataFrame, max_gap_bars: int, bar_minutes: 
 
     merged = pd.DataFrame(merged_rows)
     merged = merged.rename(columns={"timestamp": "first_seen"})
-    return merged[["first_seen", "last_seen", "occurrences", "kind", "tickers", "severity", "headline", "detail", "evidence"]]
+    return merged[["first_seen", "last_seen", "occurrences", "kind", "tickers", "severity", "headline", "detail", "evidence", "consensus"]]
 
 
 def generate_all_alerts(
@@ -222,7 +235,7 @@ def generate_all_alerts(
     """
     alerts = generate_ticker_alerts(scored_by_ticker, news_lookup) + generate_correlation_alerts(correlation_breaks)
     if not alerts:
-        cols = ["first_seen", "last_seen", "occurrences", "kind", "tickers", "severity", "headline", "detail", "evidence"]
+        cols = ["first_seen", "last_seen", "occurrences", "kind", "tickers", "severity", "headline", "detail", "evidence", "consensus"]
         return pd.DataFrame(columns=cols)
 
     df = pd.DataFrame([a.to_dict() for a in alerts])

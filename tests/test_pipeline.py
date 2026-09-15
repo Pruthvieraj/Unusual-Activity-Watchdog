@@ -20,13 +20,13 @@ from config import CONFIG
 from correlation_watch import detect_correlation_breaks
 from data.synthetic import generate_market_tape
 from features import build_all_features
-from models.anomaly_model import score_all
+from models.ensemble import build_ensemble
 
 
 def run_scenario(seed: int):
     market = generate_market_tape(seed=seed)
     features = build_all_features(market)
-    scored = score_all(features)
+    scored = build_ensemble(features)
     breaks = detect_correlation_breaks(market["returns"])
     news_lookup = build_synthetic_news_lookup(market["news"], CONFIG.news_lookback_hours)
     alerts = generate_all_alerts(scored, breaks, news_lookup, merge_bar_minutes=CONFIG.simulate_bar_freq_minutes)
@@ -70,7 +70,7 @@ def test_no_alerts_on_pure_noise():
     events)."""
     market = generate_market_tape(seed=99, n_anomalies=0)
     features = build_all_features(market)
-    scored = score_all(features)
+    scored = build_ensemble(features)
     breaks = detect_correlation_breaks(market["returns"])
     alerts = generate_all_alerts(scored, breaks, merge_bar_minutes=CONFIG.simulate_bar_freq_minutes)
     high_severity = alerts[alerts["severity"] == "High"]
@@ -78,10 +78,25 @@ def test_no_alerts_on_pure_noise():
     assert len(high_severity) < 15
 
 
+def test_order_flow_surveillance():
+    from data.orderbook_synthetic import generate_order_events
+    from order_flow import run_surveillance
+
+    result = generate_order_events("AAPL", seed=3)
+    flags = run_surveillance(result["events"])
+    caught_kinds = set(flags["kind"]) if not flags.empty else set()
+    injected_kinds = {g["kind"] for g in result["ground_truth"]}
+    missed = injected_kinds - caught_kinds
+    print(f"Order-flow surveillance: injected {injected_kinds}, caught {caught_kinds}")
+    assert not missed, f"Missed injected manipulation patterns: {missed}"
+
+
 if __name__ == "__main__":
     test_pipeline_runs_without_error()
     print("test_pipeline_runs_without_error: PASS")
     test_no_alerts_on_pure_noise()
     print("test_no_alerts_on_pure_noise: PASS")
+    test_order_flow_surveillance()
+    print("test_order_flow_surveillance: PASS")
     test_recall_across_seeds()
     print("test_recall_across_seeds: PASS")

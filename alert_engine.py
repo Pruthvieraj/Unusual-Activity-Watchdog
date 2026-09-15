@@ -20,18 +20,20 @@ import pandas as pd
 
 from config import CONFIG
 from models.anomaly_model import explain_point
+from news_relevance import score_headline_relevance
 
 
 @dataclass
 class Alert:
     timestamp: pd.Timestamp
-    kind: str                  # volume_burst | unexplained_price_jump | explained_price_move | correlated_group_move
+    kind: str                  # volume_burst | unexplained_price_jump | explained_price_move | correlated_group_move | market_wide_move | volatility_spike
     tickers: list[str]
     severity: str               # Low | Medium | High
     headline: str
     detail: str
     evidence: dict = field(default_factory=dict)
     consensus: bool = False     # True when both the Isolation Forest AND the autoencoder flagged this bar
+    confidence: float = 0.0     # 0-100 numeric confidence, alongside the Low/Medium/High severity label
 
     def to_dict(self) -> dict:
         d = self.__dict__.copy()
@@ -39,27 +41,63 @@ class Alert:
         return d
 
 
-NewsLookup = Callable[[str, pd.Timestamp], bool]
+# A news lookup returns {"found": bool, "headline": str | None, "relevance": float}
+# rather than a bare bool -- "a headline exists nearby" and "this headline
+# explains this move" are different questions, and only the second one is
+# what the problem statement actually asks for.
+NewsLookup = Callable[[str, pd.Timestamp], dict]
+
+_NO_NEWS = {"found": False, "headline": None, "relevance": 0.0}
 
 
 def build_synthetic_news_lookup(news_df: pd.DataFrame, lookback_hours: int) -> NewsLookup:
-    """News-presence check backed by the synthetic news table (used in demo
-    mode). Returns True if there's a headline for `ticker` within
-    `lookback_hours` of `timestamp`.
+    """Relevance-scored news check backed by the synthetic news table (used
+    in demo mode). For a `ticker`/`timestamp`, finds the nearest headline(s)
+    within `lookback_hours` and scores each with news_relevance.py's
+    TF-IDF + keyword model, returning the most relevant one -- not just
+    whether a headline happens to exist nearby.
     """
     if news_df is None or news_df.empty:
-        return lambda ticker, ts: False
+        return lambda ticker, ts: dict(_NO_NEWS)
 
     window = pd.Timedelta(hours=lookback_hours)
 
-    def lookup(ticker: str, ts: pd.Timestamp) -> bool:
+    def lookup(ticker: str, ts: pd.Timestamp) -> dict:
         sub = news_df[news_df["ticker"] == ticker]
         if sub.empty:
-            return False
+            return dict(_NO_NEWS)
         diffs = (sub["timestamp"] - ts).abs()
-        return bool((diffs <= window).any())
+        nearby = sub[diffs <= window]
+        if nearby.empty:
+            return dict(_NO_NEWS)
+        scored = [(row["headline"], score_headline_relevance(row["headline"], ticker)) for _, row in nearby.iterrows()]
+        headline, relevance = max(scored, key=lambda hr: hr[1])
+        return {"found": True, "headline": headline, "relevance": relevance}
 
     return lookup
+
+
+def _confidence_score(z: float, consensus: bool = False) -> float:
+    """Collapse an anomaly-magnitude z-score into a single 0-100 confidence
+    figure, so an alert's evidence reads as one glance-able number instead
+    of only a Low/Medium/High label -- mirrors the brief's own example
+    alert format ("Anomaly Score: 94/100"). Deliberately simple and
+    documented rather than a fitted/calibrated probability: monotonically
+    increasing in |z|, saturating at 100 once z is well past the alert
+    thresholds already in config.py (~2.25-3.0), so the number stays
+    meaningful without a hard cliff at any single value.
+
+    Dual-model consensus (both the Isolation Forest AND the autoencoder
+    independently flagging the same bar) adds a fixed boost on top, since
+    that agreement is strictly stronger evidence than either model alone --
+    so for the same underlying z, a consensus alert is always >= the
+    single-model score.
+    """
+    z = abs(float(z))
+    base = min(100.0, 30.0 + 14.0 * z)
+    if consensus:
+        base = min(100.0, base + 8.0)
+    return round(max(0.0, base), 1)
 
 
 def _severity_for_ticker_anomaly(scored_df: pd.DataFrame, ts: pd.Timestamp) -> str:
@@ -115,6 +153,15 @@ def generate_ticker_alerts(
                 severity = "High"  # two independent models agreeing overrides the usual ranking
             consensus_tag = " [AI consensus: Isolation Forest + Autoencoder]" if is_consensus else ""
 
+            # Confidence is driven by the ensemble's own normalized
+            # magnitude (models/ensemble.py's ensemble_score already blends
+            # the Isolation Forest's and autoencoder's z-scaled outputs)
+            # when available, falling back to the raw driver z-score for
+            # callers that only ran the Isolation Forest on its own.
+            driver_z = abs(float(row.get(top_driver, 0.0)))
+            ensemble_z = abs(float(row["ensemble_score"])) if "ensemble_score" in df.columns and pd.notna(row.get("ensemble_score")) else driver_z
+            confidence = _confidence_score(max(driver_z, ensemble_z), consensus=is_consensus)
+
             if top_driver == "volume_zscore":
                 alerts.append(Alert(
                     timestamp=ts, kind="volume_burst", tickers=[ticker], severity=severity,
@@ -122,26 +169,41 @@ def generate_ticker_alerts(
                     detail=(f"Volume z-score {row['volume_zscore']:.2f} "
                             f"({row['volume']:,.0f} shares) -- well outside {ticker}'s normal range.{consensus_tag}"),
                     evidence={"drivers": explanation["ranked_drivers"], "volume": float(row["volume"])},
-                    consensus=is_consensus,
+                    consensus=is_consensus, confidence=confidence,
                 ))
             elif top_driver == "return_zscore":
-                has_news = news_lookup(ticker, ts) if news_lookup else False
+                news = news_lookup(ticker, ts) if news_lookup else dict(_NO_NEWS)
+                has_news = news.get("found", False)
+                relevance = news.get("relevance", 0.0)
+                explained = has_news and relevance >= CONFIG.news_relevance_explained_threshold
                 move_pct = row["return"] * 100
-                if has_news:
+                if explained:
                     alerts.append(Alert(
                         timestamp=ts, kind="explained_price_move", tickers=[ticker], severity="Low",
                         headline=f"{ticker}: large but explained price move",
-                        detail=f"{move_pct:+.2f}% move, but a matching headline was found nearby -- likely news-driven.",
-                        evidence={"drivers": explanation["ranked_drivers"], "return_pct": float(move_pct)},
-                        consensus=is_consensus,
+                        detail=(f"{move_pct:+.2f}% move -- \"{news.get('headline')}\" scored "
+                                f"{relevance:.0%} relevant to this kind of move, likely news-driven."),
+                        evidence={"drivers": explanation["ranked_drivers"], "return_pct": float(move_pct),
+                                  "news_headline": news.get("headline"), "news_relevance": relevance},
+                        consensus=is_consensus, confidence=confidence,
                     ))
                 else:
+                    if has_news:
+                        # A headline exists nearby, but it didn't clear the
+                        # relevance bar -- worth surfacing so an analyst
+                        # doesn't wonder why "there's a headline" wasn't
+                        # treated as an explanation.
+                        detail = (f"{move_pct:+.2f}% move; a nearby headline (\"{news.get('headline')}\") scored only "
+                                  f"{relevance:.0%} relevant -- not treated as an explanation.{consensus_tag}")
+                    else:
+                        detail = f"{move_pct:+.2f}% move with no matching headline in the surrounding window.{consensus_tag}"
                     alerts.append(Alert(
                         timestamp=ts, kind="unexplained_price_jump", tickers=[ticker], severity=severity,
                         headline=f"{ticker}: unexplained price jump",
-                        detail=f"{move_pct:+.2f}% move with no matching headline in the surrounding window.{consensus_tag}",
-                        evidence={"drivers": explanation["ranked_drivers"], "return_pct": float(move_pct)},
-                        consensus=is_consensus,
+                        detail=detail,
+                        evidence={"drivers": explanation["ranked_drivers"], "return_pct": float(move_pct),
+                                  "news_headline": news.get("headline"), "news_relevance": relevance},
+                        consensus=is_consensus, confidence=confidence,
                     ))
             else:
                 # volatility itself was the dominant driver -- still worth a
@@ -151,12 +213,22 @@ def generate_ticker_alerts(
                     headline=f"{ticker}: elevated volatility",
                     detail=f"Rolling volatility spiked to {row['volatility']:.4f}.",
                     evidence={"drivers": explanation["ranked_drivers"]},
+                    confidence=confidence,
                 ))
 
     return alerts
 
 
 def generate_correlation_alerts(correlation_breaks: pd.DataFrame) -> list[Alert]:
+    """Turns each flagged correlation break into either a
+    `correlated_group_move` (a genuine small-group cluster) or a
+    `market_wide_move` (the whole watchlist moved together -- a broad
+    event, not a targeted signal), based on the `move_kind` column
+    correlation_watch.py's concentration-ratio check already computed.
+    Conflating the two was the single most-findable gap in the project
+    (see README/Known limitations): a Fed announcement and a genuine
+    coordinated pump used to look identical to this engine.
+    """
     alerts: list[Alert] = []
     flagged = correlation_breaks[correlation_breaks["is_break"]]
     for ts, row in flagged.iterrows():
@@ -167,14 +239,37 @@ def generate_correlation_alerts(correlation_breaks: pd.DataFrame) -> list[Alert]
         # (needed for _merge_consecutive_alerts to recognize repeat bars of
         # the same cluster as one ongoing event rather than new ones).
         cluster = sorted(cluster)
-        severity = "High" if row["delta_zscore"] > 3 else "Medium"
-        alerts.append(Alert(
-            timestamp=ts, kind="correlated_group_move", tickers=list(cluster), severity=severity,
-            headline=f"{', '.join(cluster)}: moving together outside normal correlation",
-            detail=(f"Pairwise correlation jumped {row['corr_delta']:+.2f} vs baseline "
-                    f"(z={row['delta_zscore']:.2f}) -- unusual coordinated movement."),
-            evidence={"corr_delta": float(row["corr_delta"]), "delta_zscore": float(row["delta_zscore"])},
-        ))
+        move_kind = row.get("move_kind") or "correlated_group_move"
+        confidence = _confidence_score(row["delta_zscore"])
+
+        if move_kind == "market_wide_move":
+            # Deliberately lower urgency than a genuine cluster even at the
+            # same delta_zscore -- a broad market move isn't the "suspicious
+            # coordinated group" pattern the problem statement describes.
+            severity = "Medium" if row["delta_zscore"] > 3 else "Low"
+            alerts.append(Alert(
+                timestamp=ts, kind="market_wide_move", tickers=list(cluster), severity=severity,
+                headline="Broad market-wide move across the watchlist (not a targeted cluster)",
+                detail=(f"Pairwise correlation jumped {row['corr_delta']:+.2f} vs baseline (z={row['delta_zscore']:.2f}), "
+                        f"but concentration ratio {row.get('concentration_ratio', 0):.2f}x is below the "
+                        f"{CONFIG.correlation_concentration_ratio_threshold:.1f}x cluster threshold -- essentially the "
+                        "whole watchlist moved together, not a suspicious subset."),
+                evidence={"corr_delta": float(row["corr_delta"]), "delta_zscore": float(row["delta_zscore"]),
+                          "concentration_ratio": float(row.get("concentration_ratio", 0))},
+                confidence=confidence,
+            ))
+        else:
+            severity = "High" if row["delta_zscore"] > 3 else "Medium"
+            alerts.append(Alert(
+                timestamp=ts, kind="correlated_group_move", tickers=list(cluster), severity=severity,
+                headline=f"{', '.join(cluster)}: moving together outside normal correlation",
+                detail=(f"Pairwise correlation jumped {row['corr_delta']:+.2f} vs baseline "
+                        f"(z={row['delta_zscore']:.2f}), concentrated {row.get('concentration_ratio', 0):.2f}x above "
+                        "the rest of the book -- unusual coordinated movement, not a broad market move."),
+                evidence={"corr_delta": float(row["corr_delta"]), "delta_zscore": float(row["delta_zscore"]),
+                          "concentration_ratio": float(row.get("concentration_ratio", 0))},
+                confidence=confidence,
+            ))
     return alerts
 
 
@@ -206,6 +301,7 @@ def _merge_consecutive_alerts(df: pd.DataFrame, max_gap_bars: int, bar_minutes: 
                 current["detail"] = row["detail"]  # keep most recent wording
                 current["evidence"] = row["evidence"]
                 current["consensus"] = current.get("consensus", False) or row.get("consensus", False)
+                current["confidence"] = max(current.get("confidence", 0.0), row.get("confidence", 0.0))
             else:
                 if current is not None:
                     merged_rows.append(current)
@@ -217,7 +313,7 @@ def _merge_consecutive_alerts(df: pd.DataFrame, max_gap_bars: int, bar_minutes: 
 
     merged = pd.DataFrame(merged_rows)
     merged = merged.rename(columns={"timestamp": "first_seen"})
-    return merged[["first_seen", "last_seen", "occurrences", "kind", "tickers", "severity", "headline", "detail", "evidence", "consensus"]]
+    return merged[["first_seen", "last_seen", "occurrences", "kind", "tickers", "severity", "headline", "detail", "evidence", "consensus", "confidence"]]
 
 
 def generate_all_alerts(
@@ -235,7 +331,7 @@ def generate_all_alerts(
     """
     alerts = generate_ticker_alerts(scored_by_ticker, news_lookup) + generate_correlation_alerts(correlation_breaks)
     if not alerts:
-        cols = ["first_seen", "last_seen", "occurrences", "kind", "tickers", "severity", "headline", "detail", "evidence", "consensus"]
+        cols = ["first_seen", "last_seen", "occurrences", "kind", "tickers", "severity", "headline", "detail", "evidence", "consensus", "confidence"]
         return pd.DataFrame(columns=cols)
 
     df = pd.DataFrame([a.to_dict() for a in alerts])

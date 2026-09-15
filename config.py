@@ -45,7 +45,18 @@ class WatchdogConfig:
     # constant re-tuned per watchlist.
     correlation_break_zscore: float = 2.25
     correlation_delta_history_window: int = 60  # bars used to judge "is this delta typical"
+    # A break is only classified as a genuine small-group "correlated_group_move"
+    # when the top-k cluster signal is at least this many times larger than the
+    # FULL matrix's average |delta| at that same moment. Below this ratio, the
+    # whole book moved together (a market-wide event), not a suspicious subset,
+    # so it's labeled "market_wide_move" instead -- see correlation_watch.py.
+    correlation_concentration_ratio_threshold: float = 1.8
     news_lookback_hours: int = 6            # "no news" window around a price jump
+    # A headline within the lookback window only counts as "explaining" a
+    # price jump if its relevance score (news_relevance.py: TF-IDF similarity
+    # to market-moving event archetypes + keyword/entity match) clears this
+    # bar -- presence alone ("a headline exists") is not enough.
+    news_relevance_explained_threshold: float = 0.45
 
     # --- Neural autoencoder (second, independent anomaly model) -----------
     autoencoder_window: int = 3            # bars of feature history flattened into one input
@@ -62,6 +73,13 @@ class WatchdogConfig:
     simulate_bar_freq_minutes: int = 5
     simulate_anomaly_count: int = 4
     simulate_group_shock_bars: int = 10   # consecutive bars a correlated-move shock spans
+
+    # --- "Continuous" monitoring (Live mode autorefresh) --------------------
+    # How often Live mode silently re-pulls yfinance data and re-scores,
+    # without any user click -- this is what makes "continuously watches" a
+    # true statement instead of aspirational language, and gives a fixed,
+    # quotable worst-case detection latency (bar interval + this number).
+    live_autorefresh_seconds: int = 25
 
 
 CONFIG = WatchdogConfig()

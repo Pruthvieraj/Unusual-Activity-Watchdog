@@ -15,6 +15,15 @@ with a composite market-stress gauge, a 3D anomaly-feature-space view, a
 correlation network diagram, browser voice alerts, and one-click PDF
 incident reports.
 
+v2.1 (post-review hardening): a background autorefresh in Live mode (so
+"continuously watches" is a true statement, with a fixed, quotable
+worst-case detection latency instead of "whenever someone last clicked
+refresh"), a relevance-scored news check (TF-IDF + keyword match against
+market-moving-event archetypes, not just "does a headline exist nearby"),
+a numeric 0-100 confidence score per alert alongside the severity label,
+and a correlation-engine concentration check that tells a genuine small
+coordinated cluster apart from an ordinary market-wide move.
+
 Run with:  streamlit run app.py
 """
 
@@ -33,11 +42,18 @@ from alert_engine import build_synthetic_news_lookup, generate_all_alerts
 from config import CONFIG
 from correlation_watch import detect_correlation_breaks
 from data.synthetic import generate_market_tape
+from data_source import resolve_market_data
 from features import build_all_features
 from models.ensemble import build_ensemble
 from order_flow import run_surveillance
 from report_generator import generate_incident_report
 from stress_index import compute_stress_series, stress_label
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+    _AUTOREFRESH_AVAILABLE = True
+except ImportError:  # pragma: no cover - only hit if the optional dep is missing
+    _AUTOREFRESH_AVAILABLE = False
 from viz_extra import build_3d_landscape, build_correlation_network, speak_snippet
 
 # --------------------------------------------------------------------------
@@ -62,6 +78,7 @@ KIND_LABELS = {
     "unexplained_price_jump": "Unexplained price jump",
     "explained_price_move": "Explained price move",
     "correlated_group_move": "Correlated group move",
+    "market_wide_move": "Market-wide move (not a cluster)",
     "volatility_spike": "Volatility spike",
 }
 
@@ -96,19 +113,34 @@ def load_simulated(seed: int, tickers: tuple[str, ...]):
     return generate_market_tape(tickers=list(tickers), seed=seed)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=CONFIG.live_autorefresh_seconds)
 def load_live(tickers: tuple[str, ...]):
+    # `ttl` matches the autorefresh interval below: once the cache entry
+    # expires, the next autorefresh-triggered rerun genuinely re-pulls
+    # fresh bars instead of silently re-serving the same cached response --
+    # this is what makes the periodic rerun an actual data refresh, not
+    # just a cosmetic re-render on a timer.
     from data.live_feed import fetch_intraday
     return fetch_intraday(tickers=list(tickers))
 
 
 @st.cache_data(show_spinner=False)
-def run_pipeline(market: dict, news_df_key: str, bar_minutes: float):
+def run_pipeline(market: dict, news_df_key: str, bar_minutes: float, live_news: bool = False):
     features = build_all_features(market)
     scored = build_ensemble(features)
     breaks = detect_correlation_breaks(market["returns"])
     news_df = market.get("news")
-    news_lookup = build_synthetic_news_lookup(news_df, CONFIG.news_lookback_hours) if news_df is not None else None
+    if news_df is not None:
+        news_lookup = build_synthetic_news_lookup(news_df, CONFIG.news_lookback_hours)
+    elif live_news:
+        # Live mode has no synthetic news table -- pull real yfinance
+        # headlines and run them through the same relevance-scoring model
+        # (news_relevance.py) the demo path uses, instead of leaving live
+        # mode with no news check at all.
+        from data.live_feed import build_live_news_lookup
+        news_lookup = build_live_news_lookup(CONFIG.news_lookback_hours)
+    else:
+        news_lookup = None
     alerts = generate_all_alerts(scored, breaks, news_lookup, include_low_severity=True, merge_bar_minutes=bar_minutes)
     stress = compute_stress_series(scored, breaks)
     return scored, breaks, alerts, stress
@@ -185,6 +217,7 @@ watchlist = st.sidebar.multiselect("Watchlist", options=sorted(set(default_watch
 if not watchlist:
     watchlist = default_watchlist
 
+live_autorefresh = False
 if mode.startswith("Simulated"):
     seed = st.sidebar.number_input("Scenario seed", min_value=1, max_value=9999, value=12, step=1,
                                     help="Change this to generate a different (but equally reproducible) anomaly scenario.")
@@ -194,8 +227,17 @@ if mode.startswith("Simulated"):
     seed = st.session_state.get("seed_override", seed)
 else:
     seed = None
-    if st.sidebar.button("\U0001F504 Refresh live data"):
+    if st.sidebar.button("\U0001F504 Refresh live data now"):
         load_live.clear()
+    live_autorefresh = st.sidebar.checkbox(
+        "⏱️ Auto-refresh (continuous monitoring)", value=True,
+        help=(f"Silently re-pulls live data and re-scores every {CONFIG.live_autorefresh_seconds}s with no click "
+              "needed -- this is what makes \"continuously watches\" a true statement instead of only updating "
+              "on page load or a manual refresh."),
+        disabled=not _AUTOREFRESH_AVAILABLE,
+    )
+    if not _AUTOREFRESH_AVAILABLE:
+        st.sidebar.caption("Install `streamlit-autorefresh` (see requirements.txt) to enable timed autorefresh.")
 
 show_low_severity = st.sidebar.checkbox("Show low-severity items", value=False)
 min_occurrences = st.sidebar.slider("Min. bars an event must persist", 1, 5, 1)
@@ -205,38 +247,42 @@ voice_alerts_enabled = st.sidebar.checkbox("\U0001F50A Voice alerts in Live Repl
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
-    "Detection stack: an Isolation Forest + neural autoencoder ensemble (SHAP-explained) for "
-    "volume/price anomalies, a correlation-break engine for cross-stock coordinated moves, and a "
-    "rule-based order-flow surveillance layer for spoofing/layering/quote-stuffing/wash-trading."
+    "Detection stack: an Isolation Forest + neural autoencoder ensemble (SHAP-explained, periodic "
+    "retrospective sweeps of the recent window) for volume/price anomalies, a correlation-break engine "
+    "with a concentration check (genuine small cluster vs. market-wide move) for cross-stock coordinated "
+    "moves, a relevance-scored news check (not just \"a headline exists\"), and a rule-based order-flow "
+    "surveillance layer for spoofing/layering/quote-stuffing/wash-trading. Every alert also carries a "
+    "0-100 confidence score alongside its severity label."
 )
+
+# --------------------------------------------------------------------------
+# Autorefresh: in Live mode, silently rerun the whole script on a timer so
+# fresh bars actually get pulled and re-scored without any click -- this
+# (plus load_live's matching `ttl`) is what makes "continuously watches" a
+# real, testable claim rather than "whenever a human last hit refresh".
+# --------------------------------------------------------------------------
+if mode.startswith("Live") and live_autorefresh and _AUTOREFRESH_AVAILABLE:
+    st_autorefresh(interval=CONFIG.live_autorefresh_seconds * 1000, key="watchdog_live_autorefresh")
 
 # --------------------------------------------------------------------------
 # Load data (with graceful fallback to simulated if live fails)
 # --------------------------------------------------------------------------
-data_source_note = ""
-if mode.startswith("Simulated"):
-    market = load_simulated(seed, tuple(watchlist))
-    bar_minutes = CONFIG.simulate_bar_freq_minutes
-else:
-    try:
-        market = load_live(tuple(watchlist))
-        if market["prices"].dropna(how="all").empty:
-            raise RuntimeError("empty response")
-        bar_minutes = 5 if CONFIG.intraday_interval.endswith("m") else 1440
-        data_source_note = "Live data via yfinance."
-    except Exception as e:
-        st.warning(
-            f"Couldn't reach live market data from this environment ({e}). "
-            "Falling back to the simulated demo scenario so the dashboard still works -- "
-            "on a machine with normal internet access, live mode pulls real yfinance data."
-        )
-        market = load_simulated(12, tuple(watchlist))
-        bar_minutes = CONFIG.simulate_bar_freq_minutes
-        mode = "Simulated demo (recommended)"
-        seed = 12
+load_result = resolve_market_data(
+    mode, watchlist, seed,
+    fetch_live=lambda tks: load_live(tuple(tks)),
+    fetch_simulated=lambda tks, sd: load_simulated(sd, tuple(tks)),
+)
+market = load_result["market"]
+bar_minutes = load_result["bar_minutes"]
+mode = load_result["mode"]
+seed = load_result["seed"]
+data_source_note = load_result["note"]
+if load_result["error"]:
+    st.warning(data_source_note)
+    data_source_note = ""
 
 news_key = "synthetic" if "news" in market else "none"
-scored, breaks, alerts, stress_series = run_pipeline(market, news_key, bar_minutes)
+scored, breaks, alerts, stress_series = run_pipeline(market, news_key, bar_minutes, live_news=mode.startswith("Live"))
 current_stress = float(stress_series.iloc[-1]) if len(stress_series) else 0.0
 
 if not show_low_severity:
@@ -250,11 +296,21 @@ alerts_view = alerts_view[alerts_view["occurrences"] >= min_occurrences]
 # --------------------------------------------------------------------------
 st.title("\U0001F6A8 Unusual Activity Watchdog")
 st.caption(
-    "AI in FinTech · Synapse 1.0 -- continuously watches live buying/selling activity "
-    "across a watchlist and raises alerts when something breaks the normal pattern."
+    "AI in FinTech · Synapse 1.0 -- watches buying/selling activity across a watchlist with periodic "
+    "retrospective sweeps of the recent window (not literal tick-by-tick streaming inference) and raises "
+    "alerts when something breaks the normal pattern."
 )
 if data_source_note:
     st.caption(data_source_note)
+if mode.startswith("Live") and live_autorefresh and _AUTOREFRESH_AVAILABLE:
+    worst_case_latency_s = bar_minutes * 60 + CONFIG.live_autorefresh_seconds
+    st.caption(
+        f"\U0001F7E2 Continuous monitoring active -- re-pulls and re-scores every "
+        f"{CONFIG.live_autorefresh_seconds}s. Worst-case detection latency ≈ {worst_case_latency_s}s "
+        f"(bar interval + refresh interval), a fixed, quotable number instead of \"whenever someone last clicked refresh.\""
+    )
+elif mode.startswith("Live"):
+    st.caption("⚪ Auto-refresh is off -- this pipeline recomputes on page load / manual refresh only right now.")
 
 kpi_col, gauge_col = st.columns([3, 1])
 with kpi_col:
@@ -289,11 +345,12 @@ with tab_feed:
         )
         display_df["severity_badge"] = display_df["severity"].map(lambda s: f"{STATUS_ICON[s]} {s}")
         display_df["ai"] = display_df["consensus"].map(lambda c: "\U0001F916\U0001F916 Consensus" if c else "\U0001F916 Single model")
+        display_df["confidence_badge"] = display_df.get("confidence", 0.0).map(lambda c: f"{c:.0f}/100")
 
         st.dataframe(
-            display_df[["window", "severity_badge", "ai", "kind", "tickers", "headline", "occurrences"]].rename(columns={
-                "window": "When", "severity_badge": "Severity", "ai": "AI agreement", "kind": "Type",
-                "tickers": "Ticker(s)", "headline": "Alert", "occurrences": "Bars",
+            display_df[["window", "severity_badge", "confidence_badge", "ai", "kind", "tickers", "headline", "occurrences"]].rename(columns={
+                "window": "When", "severity_badge": "Severity", "confidence_badge": "Confidence", "ai": "AI agreement",
+                "kind": "Type", "tickers": "Ticker(s)", "headline": "Alert", "occurrences": "Bars",
             }),
             use_container_width=True, hide_index=True, height=380,
         )
@@ -317,6 +374,8 @@ with tab_feed:
                 st.markdown(
                     f"<span class='watchdog-badge' style='background:{badge_color}22;color:{badge_color};'>"
                     f"{row['severity']} severity</span>"
+                    f"<span class='watchdog-badge' style='background:{CATEGORICAL[0]}22;color:{CATEGORICAL[0]};'>"
+                    f"Confidence {row.get('confidence', 0):.0f}/100</span>"
                     f"<span class='watchdog-badge' style='background:{INK_MUTED}22;color:{INK_SECONDARY};'>"
                     f"{row['occurrences']} bar(s)</span>{consensus_badge}",
                     unsafe_allow_html=True,
@@ -344,9 +403,18 @@ with tab_feed:
                                            template="plotly_dark", paper_bgcolor=SURFACE, plot_bgcolor=SURFACE,
                                            font=dict(color=INK_SECONDARY, size=12))
                         st.plotly_chart(fig, use_container_width=True)
-                elif row["kind"] == "correlated_group_move":
+                elif row["kind"] in ("correlated_group_move", "market_wide_move"):
                     st.metric("Correlation delta vs baseline", f"{row['evidence'].get('corr_delta', 0):+.2f}")
                     st.metric("Unusualness (z-score)", f"{row['evidence'].get('delta_zscore', 0):.2f}")
+                    ratio = row["evidence"].get("concentration_ratio")
+                    if ratio is not None:
+                        st.metric(
+                            "Concentration ratio",
+                            f"{ratio:.2f}x",
+                            help=f"Cluster threshold is {CONFIG.correlation_concentration_ratio_threshold:.1f}x -- "
+                                 "above it, a small subset moved much more than the rest of the book (a genuine "
+                                 "cluster); at/below it, roughly the whole watchlist moved together (market-wide).",
+                        )
 
             # Ticker-level chart for the primary ticker(s) in this alert
             for tkr in row["tickers"].split(", "):

@@ -75,9 +75,11 @@ def generate_incident_report(alert_row: dict, scored_by_ticker: dict, output_pat
     story.append(Paragraph("Automated Surveillance Incident Report", sub_style))
 
     severity = alert_row.get("severity", "Medium")
+    confidence = alert_row.get("confidence", 0.0) or 0.0
     meta_table = Table([
         ["Report ID", report_id, "Generated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")],
-        ["Severity", severity, "Consensus", "Yes -- 2 independent AI models agree" if alert_row.get("consensus") else "No -- single-model flag"],
+        ["Severity", severity, "Confidence", f"{confidence:.0f} / 100"],
+        ["Consensus", "Yes -- 2 independent AI models agree" if alert_row.get("consensus") else "No -- single-model flag", "", ""],
     ], colWidths=[1.0 * inch, 2.4 * inch, 1.0 * inch, 2.1 * inch])
     meta_table.setStyle(TableStyle([
         ("FONTSIZE", (0, 0), (-1, -1), 8.5),
@@ -87,6 +89,7 @@ def generate_incident_report(alert_row: dict, scored_by_ticker: dict, output_pat
         ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
         ("TEXTCOLOR", (1, 0), (1, 0), STATUS_COLORS.get(severity, MUTED)),
         ("FONTNAME", (1, 0), (1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (1, 1), (1, 1), "Helvetica-Bold"),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
         ("LINEBELOW", (0, -1), (-1, -1), 0.5, colors.HexColor("#e1e0d9")),
     ]))
@@ -131,9 +134,15 @@ def generate_incident_report(alert_row: dict, scored_by_ticker: dict, output_pat
         story.append(t)
     elif "corr_delta" in evidence:
         story.append(Paragraph("Model Evidence (correlation-break engine)", h2_style))
+        concentration_line = ""
+        if "concentration_ratio" in evidence:
+            kind_note = ("genuine small cluster" if alert_row.get("kind") == "correlated_group_move"
+                         else "broad market-wide move, not a targeted cluster")
+            concentration_line = (f"<br/>Concentration ratio: <b>{evidence.get('concentration_ratio', 0):.2f}x</b> "
+                                   f"({kind_note})")
         story.append(Paragraph(
             f"Pairwise correlation delta vs. baseline: <b>{evidence.get('corr_delta', 0):+.3f}</b><br/>"
-            f"Unusualness (z-score): <b>{evidence.get('delta_zscore', 0):.2f}</b>", body_style))
+            f"Unusualness (z-score): <b>{evidence.get('delta_zscore', 0):.2f}</b>{concentration_line}", body_style))
 
     tickers = str(alert_row.get("tickers", "")).split(", ")
     ts = alert_row.get("first_seen")

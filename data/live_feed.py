@@ -14,6 +14,7 @@ import pandas as pd
 import yfinance as yf
 
 from config import CONFIG
+from news_relevance import score_headline_relevance
 
 
 def fetch_intraday(tickers: list[str] | None = None) -> dict:
@@ -69,10 +70,13 @@ def fetch_recent_news(ticker: str, limit: int = 10) -> list[dict]:
 
 
 def has_recent_news(ticker: str, within_hours: int | None = None) -> bool:
-    """Best-effort check: is there a headline for this ticker within the
-    last `within_hours`? Used to separate 'explained' price jumps from
-    'unexplained' ones. Fails open (treats as "no news found") on error so a
-    flaky news call never silently suppresses a real anomaly alert.
+    """Legacy presence-only check: is there ANY headline for this ticker
+    within the last `within_hours`, regardless of what it's about? Kept for
+    backward compatibility, but `build_live_news_lookup` below is what the
+    pipeline actually uses now -- presence alone doesn't tell you whether a
+    headline explains a specific move, only that one exists somewhere
+    nearby. Fails open (treats as "no news found") on error so a flaky news
+    call never silently suppresses a real anomaly alert.
     """
     within_hours = within_hours or CONFIG.news_lookback_hours
     news = fetch_recent_news(ticker)
@@ -91,3 +95,48 @@ def has_recent_news(ticker: str, within_hours: int | None = None) -> bool:
         if published >= cutoff:
             return True
     return False
+
+
+def _parse_published(raw_ts) -> pd.Timestamp | None:
+    if raw_ts is None:
+        return None
+    try:
+        if isinstance(raw_ts, (int, float)):
+            return pd.to_datetime(raw_ts, unit="s", utc=True)
+        return pd.to_datetime(raw_ts, utc=True)
+    except Exception:
+        return None
+
+
+def build_live_news_lookup(within_hours: int | None = None):
+    """Live-mode equivalent of alert_engine.build_synthetic_news_lookup:
+    returns a `lookup(ticker, ts) -> {"found", "headline", "relevance"}`
+    callable, scored with the same news_relevance.py TF-IDF/keyword model
+    the synthetic demo path uses, instead of the old bare
+    presence/absence check. Each ticker's headlines are fetched at most
+    once per lookup object (small, bounded network cost -- one call per
+    watchlist ticker, not per alert).
+    """
+    within_hours = within_hours or CONFIG.news_lookback_hours
+    window = pd.Timedelta(hours=within_hours)
+    cache: dict[str, list[dict]] = {}
+
+    def lookup(ticker: str, ts: pd.Timestamp) -> dict:
+        if ticker not in cache:
+            try:
+                cache[ticker] = fetch_recent_news(ticker)
+            except Exception:
+                cache[ticker] = []
+
+        ts_utc = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+        best = {"found": False, "headline": None, "relevance": 0.0}
+        for item in cache[ticker]:
+            published = _parse_published(item.get("published_at"))
+            if published is None or abs(published - ts_utc) > window:
+                continue
+            relevance = score_headline_relevance(item.get("title"), ticker)
+            if relevance > best["relevance"] or not best["found"]:
+                best = {"found": True, "headline": item.get("title"), "relevance": relevance}
+        return best
+
+    return lookup

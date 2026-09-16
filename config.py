@@ -23,6 +23,20 @@ class WatchdogConfig:
     lookback_days: int = 60          # history used to build the "normal" baseline
     intraday_interval: str = "5m"    # granularity for live/near-real-time mode
     intraday_period: str = "5d"      # how far back intraday data is pulled
+    # Hard wall-clock bound on any single outbound yfinance call (quotes or
+    # news). Found necessary by Section 32's manual "fragment refresh, 3
+    # cycles" test: yf.download's own timeout=10 default only bounds ONE of
+    # the underlying HTTP calls it makes, and yf.Ticker(...).news exposes no
+    # timeout kwarg at all -- on a network that silently drops packets
+    # instead of actively rejecting them (rather than the fast, explicit
+    # 403 this sandbox's own egress proxy returns), either call can hang for
+    # a full OS-level TCP timeout (60s+), during which the st.fragment(
+    # run_every=...) header/feed appear frozen even though nothing crashed.
+    # data/live_feed.py wraps every yfinance call in this bound so a bad
+    # network fails FAST and falls back to simulated data, keeping
+    # "continuous monitoring" true under real-world flaky connectivity, not
+    # just under a clean connection or an immediate, explicit rejection.
+    live_fetch_timeout_s: float = 8.0
 
     # --- Anomaly model (Isolation Forest) -----------------------------------
     isolation_forest_contamination: float = 0.05   # expected fraction of anomalies
@@ -74,12 +88,43 @@ class WatchdogConfig:
     simulate_anomaly_count: int = 4
     simulate_group_shock_bars: int = 10   # consecutive bars a correlated-move shock spans
 
-    # --- "Continuous" monitoring (Live mode autorefresh) --------------------
+    # --- "Continuous" monitoring (Live mode autorefresh, st.fragment) -------
     # How often Live mode silently re-pulls yfinance data and re-scores,
     # without any user click -- this is what makes "continuously watches" a
     # true statement instead of aspirational language, and gives a fixed,
     # quotable worst-case detection latency (bar interval + this number).
-    live_autorefresh_seconds: int = 25
+    live_autorefresh_seconds: int = 20
+    # Options offered on the sidebar's refresh-interval control.
+    autorefresh_interval_choices: tuple = (10, 20, 60)
+    # If the last successful refresh is older than this multiple of the
+    # configured interval, the UI must show DELAYED rather than silently
+    # keep displaying stale data as if it were current.
+    stale_data_multiplier: float = 2.0
+
+    # --- Market-regime awareness (detection/regime.py) ----------------------
+    # A bar counts toward "breadth" when a ticker's |return_zscore| clears
+    # this bar -- same shape as price_jump_sigma_alert but a separate,
+    # lower constant since breadth cares about "unusual for this stock",
+    # not "alert-worthy on its own".
+    regime_breadth_zscore_threshold: float = 2.0
+    # If this fraction (or more) of the watchlist clears that threshold on
+    # the SAME bar, it's tagged a market-wide event -- individual
+    # unexplained-price-jump alerts on that bar are suppressed in favor of
+    # one consolidated market_wide_move alert (see alert_engine.py).
+    regime_breadth_cutoff: float = 0.6
+
+    # --- Momentum-shift detection (detection/momentum.py) -------------------
+    momentum_short_span: int = 5     # bars, short EWMA
+    momentum_long_span: int = 20     # bars, long EWMA
+    momentum_history_window: int = 30  # bars used to judge "is this crossover typical"
+    momentum_shift_zscore_alert: float = 2.25
+
+    # --- Persistence (data/store.py) ----------------------------------------
+    # SQLite file for alert history/investigation-workflow persistence.
+    # Lives on local disk -- see README's persistence caveat for what that
+    # means on Render's free tier (survives the running instance, wiped on
+    # redeploy/cold restart).
+    sqlite_path: str = "watchdog_alerts.db"
 
 
 CONFIG = WatchdogConfig()

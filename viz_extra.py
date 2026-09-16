@@ -42,9 +42,22 @@ def build_correlation_network(returns_window: pd.DataFrame, highlight_cluster: l
                 continue
             x0, y0 = pos[tickers[i]]
             x1, y1 = pos[tickers[j]]
+            # Pull each endpoint in slightly from the node center. Without
+            # this, an edge's endpoint coordinate is EXACTLY coincident
+            # with the node marker's own coordinate, and Plotly's
+            # closest-point hit-testing (hover AND on_select click) can
+            # resolve a click squarely on a node to the edge trace instead
+            # -- the two points tie at distance 0, so hover ends up on an
+            # arbitrary trace ordering instead of the node "on top" you'd
+            # visually expect. A small inset keeps the edge visually
+            # touching the node while leaving the node's own coordinate
+            # unambiguous.
+            inset = 0.08
+            ex0, ey0 = x0 + (x1 - x0) * inset, y0 + (y1 - y0) * inset
+            ex1, ey1 = x1 + (x0 - x1) * inset, y1 + (y0 - y1) * inset
             color = POS_EDGE if c > 0 else NEG_EDGE
             edge_traces.append(go.Scatter(
-                x=[x0, x1, None], y=[y0, y1, None], mode="lines",
+                x=[ex0, ex1, None], y=[ey0, ey1, None], mode="lines",
                 line=dict(color=color, width=1 + abs(c) * 7),
                 opacity=min(1.0, abs(c) + 0.25), hoverinfo="text",
                 text=f"{tickers[i]}-{tickers[j]}: {c:+.2f}", showlegend=False,
@@ -58,6 +71,11 @@ def build_correlation_network(returns_window: pd.DataFrame, highlight_cluster: l
         textfont=dict(color=INK_SECONDARY, size=13),
         marker=dict(size=node_sizes, color=node_colors, line=dict(width=2, color=SURFACE)),
         hoverinfo="text", showlegend=False,
+        # `customdata` (not curve/point index) is what the click-through
+        # panel reads from st.plotly_chart(..., on_select=...) -- carries
+        # the ticker name straight through regardless of how many edge
+        # traces precede this node trace in the figure.
+        customdata=tickers,
     )
 
     fig = go.Figure(data=edge_traces + [node_trace])

@@ -32,6 +32,67 @@ from a broad market-wide move, and a couple of repo-hygiene items. All five
 are addressed in this version — see the "What changed in the review pass"
 callouts throughout this README for exactly what and why.
 
+**v2.2 note (architecture upgrade):** a follow-up independent audit
+proposed a 4-sprint upgrade plan, implemented in full without a
+frontend/API rewrite -- still the same Python/Streamlit codebase:
+
+- **Two new independent detection signals**: `detection/regime.py` (a
+  price-level "breadth" check -- what fraction of the watchlist moved
+  unusually on the same bar -- independent of and complementary to
+  `correlation_watch.py`'s correlation-level concentration check) and
+  `detection/momentum.py` (a short-vs-long EWMA crossover, itself a
+  z-score outlier against its own history -- a trend-divergence signal the
+  Isolation Forest/autoencoder ensemble doesn't look for, surfaced as a new
+  `momentum_shift` alert kind).
+- **One composite 0-100 anomaly score** (`detection/score.py`) -- a
+  documented, hand-set weighted blend of six signal components -- replaces
+  ad hoc per-kind confidence math for every per-ticker alert, alongside a
+  *second*, deliberately separate number, `agreement_pct` (how many
+  independent detectors concur), so "how unusual" and "how many methods
+  agree" are never collapsed into one figure.
+- **Native `st.fragment(run_every=...)` autorefresh** replaces the
+  third-party `streamlit-autorefresh` package: the Command Center header
+  and Alert Feed silently re-pull and re-score on a configurable 10/20/60s
+  interval *without* rerunning the whole page (heavier tabs like the 3D
+  landscape and order-flow simulation no longer recompute every tick).
+  Live fetches retry with backoff before falling back to simulated, and a
+  stale-data check degrades the "continuous monitoring" banner to a
+  "data delayed" warning once the last successful refresh is too old.
+- **SQLite-backed alert persistence + an investigation workflow**
+  (`data/store.py`, `services/alert_service.py`): every alert gets a
+  stable identity across pipeline reruns and a status --
+  `NEW -> INVESTIGATING -> RESOLVED` / `FALSE POSITIVE` -- settable from
+  the Alert Feed or the new Alert History page. **Honest caveat:** on a
+  host with no persistent disk (e.g. Render's free tier), this survives
+  the running instance only -- it's wiped on redeploy or cold restart. It
+  is still a real upgrade over "nothing persists, ever."
+- **Three new pages** (Streamlit's multipage `pages/` convention, shared
+  pipeline logic factored into `services/pipeline_service.py` so a page
+  never has to re-run `app.py`'s own script to get data): a **Stock
+  Investigation Terminal** (per-ticker price/volume/momentum/news/
+  correlation/alert-history deep dive), **Alert History & Analytics**
+  (trends, breakdowns by kind/severity/ticker, investigation-outcome
+  rate), and **System Health** (a fixed battery of OK/WARN/FAIL checks
+  against a live pipeline run, so a demo presenter -- or an operator --
+  can tell "quiet market" apart from "silently broken detector").
+- **3-state news classification** (`services/news_service.py`): every
+  price-jump alert's news check is now exactly one of `NEWS EXPLAINS
+  MOVEMENT`, `POSSIBLE NEWS-MOVEMENT MISMATCH` (a headline exists nearby
+  but didn't clear the relevance bar), or `NO RELEVANT NEWS DETECTED`,
+  with a human-readable headline-to-move time gap.
+- **Command Center reassembly**: a real-time market heatmap (latest-bar
+  return/volume z-scores across the whole watchlist, refreshing with the
+  header), a **click-through correlation network** (click a node for an
+  inline ticker snapshot and a jump straight into the Stock Terminal), and
+  a **demo-mode banner** with a "trigger synthetic anomaly now" button
+  (Simulated mode only) that stamps an unmistakable move onto the current
+  scenario's latest bar so a presenter can make something happen on
+  demand.
+- **Consolidated design tokens** (`utils/design_tokens.py`,
+  `utils/formatting.py`): one source of truth for the dark-mode palette,
+  Plotly theme, badges, and empty/error/loading copy, shared by app.py and
+  every page under `pages/` instead of each redefining its own.
+
 ## Quickstart
 
 ```bash
@@ -44,11 +105,14 @@ always shows a full set of detected anomalies — good for a live pitch where
 you can't wait for something unusual to actually happen on the real market.
 Switch to **Live / historical (yfinance)** in the sidebar to pull real
 intraday data (needs normal internet access — see *Known limitations* below).
-In Live mode, **Auto-refresh (continuous monitoring)** is on by default: the
-app silently re-pulls fresh bars and re-scores every
-`config.py: live_autorefresh_seconds` (25s by default) with no click needed,
-and the header shows the resulting worst-case detection latency (bar
-interval + refresh interval) as a fixed, quotable number.
+In Live mode, **Auto-refresh (continuous monitoring)** is on by default: a
+native `st.fragment(run_every=...)` silently re-pulls fresh bars and
+re-scores the Command Center header and Alert Feed on a sidebar-configurable
+10/20/60s interval (`config.py: live_autorefresh_seconds` sets the default,
+20s) with no click needed and no full-page rerun, and the header shows the
+resulting worst-case detection latency (bar interval + refresh interval) as
+a fixed, quotable number -- degrading to a "data delayed" warning if the
+last successful refresh gets stale.
 
 Run the sanity-check test suite (checks every detector against known,
 injected ground truth):
@@ -59,15 +123,28 @@ python3 tests/test_pipeline.py
 
 ## What's in the dashboard
 
-| Tab | What it shows |
+`app.py` is the **Command Center** (7 tabs below); three more pages live
+under `pages/` (Streamlit's multipage convention -- they appear in the
+sidebar automatically).
+
+| Tab (Command Center) | What it shows |
 |---|---|
-| **Alert Feed** | Ranked, deduplicated alerts with a numeric 0-100 confidence score next to the severity label, AI-agreement badges, SHAP driver charts, and a one-click PDF incident report per alert |
+| **Alert Feed** | Ranked, deduplicated alerts with a numeric 0-100 confidence score, `agreement_pct`, AI-agreement badges, SHAP driver charts, 3-state news classification, per-alert investigation-status controls, and a one-click PDF incident report per alert |
 | **Price & Volume** | Full per-ticker detail view: price, volume, return z-score with alert thresholds drawn in |
 | **Correlation Monitor** | Rolling correlation vs. baseline over time, plus current-vs-baseline correlation heatmaps -- flagged breaks are further split into a genuine `correlated_group_move` cluster vs. a broad `market_wide_move`, shown per-alert as a concentration ratio |
-| **3D & Network** | A live correlation network diagram (flagged clusters highlighted) and a 3D scatter of every bar in anomaly-feature space |
+| **3D & Network** | A **click-through** live correlation network diagram (click a node for an inline ticker snapshot + a jump to the Stock Terminal; flagged clusters highlighted) and a 3D scatter of every bar in anomaly-feature space |
 | **Live Replay** | Scrubs/auto-plays through the scenario bar-by-bar, revealing alerts and a market-stress gauge only up to the current point in time -- watch detection happen instead of reading a static table |
 | **Order-Flow Surveillance** | Simulated order-event stream + rule-based detectors for spoofing, layering, quote stuffing, and wash trading |
 | **Detection Accuracy** | Live recall check against the simulated scenario's known, injected ground truth |
+
+The Command Center header also carries a real-time market heatmap and (in
+Simulated mode) a demo banner with a "trigger synthetic anomaly now" button.
+
+| Page (`pages/`) | What it shows |
+|---|---|
+| **Stock Investigation Terminal** | One ticker's full picture: price/volume/return-zscore detail, the momentum (EWMA crossover) signal, a news-relevance timeline, correlation-cluster context, and its own alert/investigation history |
+| **Alert History & Analytics** | Filterable log of every persisted alert, trends over time, breakdowns by kind/severity/ticker, and the resolved-vs-false-positive investigation-outcome rate |
+| **System Health** | A fixed battery of OK/WARN/FAIL checks (data source, autorefresh config, detection ensemble, correlation engine, news scorer, SQLite persistence, alert-volume sanity) against a live pipeline run |
 
 ## Why so many separate signals, not one model
 
@@ -88,6 +165,7 @@ needs its own detection strategy, not a bigger version of the same model:
 data/synthetic.py          -- simulated multi-stock tape with injected, known anomalies
 data/live_feed.py          -- real intraday data via yfinance + relevance-scored live news lookup
 data/orderbook_synthetic.py -- simulated order-EVENT stream (spoofing/layering/stuffing/wash trades)
+data/store.py                -- SQLite alert persistence + investigation-workflow CRUD (parameterized queries)
 data_source.py               -- live -> simulated fallback DECISION logic, split out so it's unit-testable
         |
         v
@@ -97,6 +175,9 @@ features.py                 -- rolling z-scores (volume, return) + volatility, p
 models/anomaly_model.py     -- per-ticker Isolation Forest, SHAP-explained
 models/autoencoder_model.py -- per-ticker neural autoencoder (reconstruction-error anomaly score)
 models/ensemble.py          -- combines both into one score + a "dual-model consensus" flag
+detection/regime.py          -- price-level breadth check (market-wide event vs. genuine small cluster)
+detection/momentum.py        -- short-vs-long EWMA crossover, z-scored against its own history
+detection/score.py           -- one composite 0-100 anomaly score (six weighted components) + agreement_pct
 correlation_watch.py         -- cross-stock rolling-correlation break detector + cluster-vs-market-wide concentration check
 news_relevance.py            -- TF-IDF + keyword relevance scoring for the news check (not just "does a headline exist")
 order_flow.py                -- rule-based spoofing/layering/stuffing/wash-trade detectors
@@ -104,11 +185,20 @@ stress_index.py              -- composite 0-100 market-stress index
         |
         v
 alert_engine.py              -- fuses all signals + relevance-scored news check into one ranked feed, with a 0-100 confidence score per alert
+services/pipeline_service.py -- shared pipeline orchestration (resolve data -> features -> ensemble -> alerts), used by app.py AND every page/
+services/alert_service.py    -- investigation-workflow service on top of data/store.py (the only module that touches sqlite3 directly)
+services/news_service.py     -- 3-state news classification (EXPLAINS / MISMATCH / NONE) + headline-to-move gap text
+services/health_service.py   -- OK/WARN/FAIL checks against a live pipeline run
+utils/design_tokens.py       -- single source of truth for the dark-mode palette, Plotly theme, badges
+utils/formatting.py          -- shared empty/error/loading copy + display-formatting helpers
 report_generator.py          -- one-click PDF incident report per alert
-viz_extra.py                 -- 3D anomaly landscape, correlation network, voice-alert snippet
+viz_extra.py                 -- 3D anomaly landscape, click-through correlation network, voice-alert snippet
         |
         v
-app.py                       -- Streamlit dashboard (7 tabs, see above) + Live-mode autorefresh
+app.py                       -- Command Center (7 tabs, see above): st.fragment autorefresh, heatmap, demo banner
+pages/1_Stock_Terminal.py    -- per-ticker deep dive
+pages/2_Alert_History.py     -- historical analytics + investigation-outcome stats
+pages/3_System_Health.py     -- system health panel
 ```
 
 ### 1. Per-ticker anomaly detection: a two-model ensemble (`models/`)
@@ -256,24 +346,35 @@ or above the single-model baseline for the same evidence (verified by
 It's shown in the Alert Feed table, the detail panel, and the PDF incident
 report header, right next to severity.
 
-### 6. Background autorefresh (Live mode) (`app.py`, `config.py`)
+### 6. Background autorefresh (Live mode) (`app.py`, `services/pipeline_service.py`, `config.py`)
 
 **What changed in the review pass — this was the single highest-leverage
 fix in the whole review.** `load_live()`/`run_pipeline()` used to only
 recompute on page load or an explicit "Refresh live data" click — nothing
 re-pulled or re-scored on a timer, so "continuously watches" was aspirational
 language, and there was no bounded, quotable detection-latency number ("it's
-however long since the last click" is not a number). Live mode now runs a
-lightweight [`streamlit-autorefresh`](https://pypi.org/project/streamlit-autorefresh/)
-timer (`config.py: live_autorefresh_seconds`, 25s by default) that reruns
-the script automatically; `load_live`'s own `@st.cache_data(ttl=...)` is set
-to the same interval, so the rerun is a genuine re-pull of fresh bars, not
-just a cosmetic re-render of stale cached data. The header then shows the
-resulting worst-case detection latency (bar interval + refresh interval) as
-a fixed number instead of an open-ended one. A closer-to-production next
-step (documented, not yet built — see *Known limitations*) is a small
-in-process background thread/APScheduler job that polls independently of
-whether a browser tab is open.
+however long since the last click" is not a number).
+
+**v2.2 update:** the original fix used the third-party
+[`streamlit-autorefresh`](https://pypi.org/project/streamlit-autorefresh/)
+package, which reran the *entire* script on a timer. That's now replaced
+with Streamlit's own native `st.fragment(run_every=...)` (`streamlit>=1.37`):
+the Command Center header and Alert Feed are each their own fragment,
+refreshing on a sidebar-configurable 10/20/60s interval *without* rerunning
+the whole page, so heavier tabs (3D landscape, order-flow simulation,
+replay) don't recompute every tick. `load_live`'s own
+`@st.cache_data(ttl=...)` still matches the interval, so a fragment tick is
+a genuine re-pull of fresh bars, not a cosmetic re-render of stale cached
+data. Live fetches also retry twice with exponential backoff
+(`services/pipeline_service.py::_fetch_live_with_retry`) before falling
+back to simulated, so one transient yfinance hiccup doesn't drop the whole
+session out of Live mode; and a stale-data check compares the last
+successful refresh against `stale_data_multiplier x` the configured
+interval, degrading the green "continuous monitoring" banner to an orange
+"data delayed" one instead of silently showing an old snapshot as current.
+A closer-to-production next step (documented, not yet built — see *Known
+limitations*) is a small in-process background thread/APScheduler job that
+polls independently of whether a browser tab is open.
 
 ## Validating detection quality
 
@@ -291,6 +392,53 @@ something you can't do against real, unlabeled market data:
 This is a demo-scale sanity check, not a production accuracy claim — real
 markets are far messier — but it's real evidence the pipeline does what it
 says, which is a stronger pitch than "trust me."
+
+### v2.2's own test plan, actually run (not just written down)
+
+The v2.2 upgrade plan's own Section 32 lists exactly what to check before
+calling any of it done, and says plainly not to claim completeness
+untested. Running every row of that table for real — not just the parts
+covered by re-running the pre-existing suite — caught two genuine bugs
+that a code-read alone had missed:
+
+- **System Health falsely reported "OK" on a failed live fetch.** Forcing
+  a live-data failure (this sandbox's own network policy blocks outbound
+  yfinance calls, which turned out to be a convenient real-world test
+  case) showed the Data Source check silently passing instead of warning,
+  because it inferred "was Live requested" from the pipeline's (by-then
+  relabeled) `mode` field instead of its `error` field. Fixed in
+  `services/health_service.py::check_data_source` to check `error`
+  first, independent of how `mode` got relabeled on fallback.
+- **A live fetch with no explicit timeout could hang past the refresh
+  interval.** `yf.download()`'s own `timeout=` only bounds part of what it
+  does, and `yf.Ticker(...).news` exposes no timeout at all — on a network
+  that silently drops packets instead of actively rejecting them (this
+  sandbox's proxy does the latter, so the gap wasn't visible until traced
+  through by hand), either call can block for a full OS-level TCP timeout
+  (60s+), during which the header/feed fragments appear frozen even
+  though nothing crashed. Fixed by wrapping every outbound yfinance call
+  in `data/live_feed.py` with a hard `CONFIG.live_fetch_timeout_s` (8s)
+  ceiling via a small thread-pool helper, so a bad network fails fast and
+  falls back, keeping "continuous monitoring" true under real-world flaky
+  connectivity, not just a clean connection.
+
+Also fixed along the way: the Command Center header had no visible
+"last refreshed" indicator at all, so the plan's "watch it tick for 3
+cycles" check had nothing to watch — added one line ("🕒 Header last
+refreshed: HH:MM:SS") that the fragment updates every cycle; and the
+investigation-workflow "Current status" caption lagged one click behind
+its own save button (it read `stored` before the button's handler ran),
+fixed with a `st.rerun()` after a successful save.
+
+`tests/test_pipeline.py` was kept **byte-for-byte unmodified** throughout,
+per the plan's own explicit requirement — including reverting an earlier,
+unnecessary rename (`_confidence_score` → `_correlation_alert_score`) that
+would otherwise have forced an edit to that file's import. The two new
+automated checks the plan's Section 32 also calls for but the existing
+suite doesn't cover (composite-score monotonicity, and an automated
+persistence round-trip) live in a separate `tests/test_sprint_upgrades.py`
+instead, specifically so this file's "must pass unmodified" guarantee is
+never put at risk by a future edit here.
 
 ## Deploying on Render
 
@@ -363,14 +511,23 @@ in-process timer inside that same process, not a separate worker dyno.
   data, score only the unseen tail) is a scoped, well-understood next step,
   staged for after this round given its cost relative to the wording fix.
 - **The autorefresh is a client-driven timer, not an independent background
-  process.** `streamlit-autorefresh` (see architecture section 6 above)
-  makes "continuously watches" true while a browser tab is open; a
-  from-scratch backend would add a small in-process poller thread (or
-  APScheduler job) that keeps running independently of any open tab —
-  documented as the next step up, not needed for free-tier Render (Phase 10
-  of the review this pass responded to: the whole process, poller included,
-  stays alive between requests on Render's free tier as long as it isn't
-  idle long enough to spin down).
+  process.** The native `st.fragment(run_every=...)` mechanism (see
+  architecture section 6 above) makes "continuously watches" true while a
+  browser tab is open; a from-scratch backend would add a small in-process
+  poller thread (or APScheduler job) that keeps running independently of
+  any open tab — documented as the next step up, not needed for free-tier
+  Render (Phase 10 of the review this pass responded to: the whole process,
+  poller included, stays alive between requests on Render's free tier as
+  long as it isn't idle long enough to spin down).
+- **Alert persistence (SQLite) survives the running instance only.** On a
+  host with no persistent disk (e.g. Render's free tier), `data/store.py`'s
+  SQLite file lives on that instance's local, ephemeral filesystem —
+  investigation status/notes survive reruns and reconnects while the
+  instance keeps running, but are wiped on every redeploy or cold restart.
+  A production deployment would point it at a managed Postgres/SQLite-on-a-
+  persistent-volume instead; the module's own functions (parameterized
+  queries throughout) would port over with a connection-string change, not
+  a rewrite.
 - **The autoencoder is an MLP, not a recurrent/transformer model.** A
   deliberate speed/footprint tradeoff for free-tier hosting and instant
   demo response (see architecture section above) — swapping in an LSTM is a
@@ -396,6 +553,7 @@ in-process timer inside that same process, not a separate worker dyno.
 ## Tech stack
 
 Python, pandas, numpy, scikit-learn (Isolation Forest + MLP autoencoder +
-TF-IDF for news relevance scoring), SHAP, Plotly, Streamlit,
-streamlit-autorefresh, yfinance, reportlab, matplotlib. No environment
-variables or API keys required for either data-source mode.
+TF-IDF for news relevance scoring), SHAP, Plotly, Streamlit (>=1.37, for
+native `st.fragment`), yfinance, reportlab, matplotlib, and the standard
+library's `sqlite3` for alert persistence. No environment variables or API
+keys required for either data-source mode.

@@ -36,10 +36,16 @@ def build_ticker_features(
       volume_zscore     -- volume normalized vs its own rolling baseline
                             (this is what "volume burst" alerts key off)
       volatility        -- rolling std of returns (context, not alerting on its own)
+      volatility_zscore -- is CURRENT volatility unusual for this stock's own
+                            recent volatility regime (self-referential z-score
+                            of the `volatility` column) -- feeds
+                            detection/score.py's composite score as the
+                            "volatility / regime context" component.
     """
     return_zscore = _rolling_zscore(returns, CONFIG.return_vol_window)
     volume_zscore = _rolling_zscore(volume.astype(float), CONFIG.volume_zscore_window)
     volatility = returns.rolling(CONFIG.return_vol_window, min_periods=5).std(ddof=0).fillna(0)
+    volatility_zscore = _rolling_zscore(volatility, CONFIG.return_vol_window)
 
     return pd.DataFrame({
         "price": prices,
@@ -48,6 +54,7 @@ def build_ticker_features(
         "volume": volume,
         "volume_zscore": volume_zscore,
         "volatility": volatility,
+        "volatility_zscore": volatility_zscore,
     })
 
 
